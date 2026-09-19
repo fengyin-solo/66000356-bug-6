@@ -21,7 +21,7 @@ export interface ParsedQuery {
   type: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'CREATE' | 'UNKNOWN'
   tables: string[]
   columns: string[]
-  joins: { type: string; table: string; condition: string }[]
+  joins: { type: string; table: string; condition: string; fromTable?: string; toTable?: string }[]
   whereConditions: string[]
   orderBy: string[]
   groupBy: string[]
@@ -58,7 +58,29 @@ function parseSQL(sql: string): ParsedQuery {
   const type = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE'].find(t => up.startsWith(t)) as ParsedQuery['type'] || 'UNKNOWN'
   const tables = Array.from(sql.matchAll(/(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z_]\w*)/gi)).map(m => m[1].toLowerCase())
   const columns = type === 'SELECT' ? Array.from(sql.matchAll(/SELECT\s+([\s\S]*?)\s+FROM/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || [] : []
-  const joins = Array.from(sql.matchAll(/(LEFT|RIGHT|INNER|OUTER|CROSS|FULL)?\s*JOIN\s+([a-zA-Z_]\w*)\s+ON\s+([^JOIN|WHERE|GROUP|ORDER|LIMIT]+)/gi)).map(m => ({ type: (m[1] || 'INNER').trim(), table: m[2], condition: m[3].trim() }))
+
+  // 表别名映射：别名 / 表名 -> 真实表名，用于把连接条件解析到真实的表两端
+  const ALIAS_KEYWORDS = new Set(['on', 'where', 'group', 'order', 'limit', 'having', 'join', 'left', 'right', 'inner', 'outer', 'cross', 'full', 'set', 'values', 'select', 'as'])
+  const aliasMap: Record<string, string> = {}
+  Array.from(sql.matchAll(/(?:FROM|JOIN|UPDATE|INTO)\s+([a-zA-Z_]\w*)(?:\s+(?:AS\s+)?([a-zA-Z_]\w*))?/gi)).forEach(m => {
+    const table = m[1].toLowerCase()
+    aliasMap[table] = table
+    const alias = m[2]?.toLowerCase()
+    if (alias && !ALIAS_KEYWORDS.has(alias)) aliasMap[alias] = table
+  })
+
+  // 连接条件用前瞻截断到下一个 JOIN/WHERE/GROUP BY/ORDER BY/HAVING/LIMIT/语句结束，
+  // 避免旧的排除字符集把 u.id 这类条件首字母当成关键字截断
+  const joins = Array.from(sql.matchAll(/\b(LEFT|RIGHT|INNER|CROSS|FULL)?(?:\s+OUTER)?\s+JOIN\s+([a-zA-Z_]\w*)(?:\s+(?:AS\s+)?[a-zA-Z_]\w*)?\s+ON\s+([\s\S]*?)(?=\b(?:LEFT|RIGHT|INNER|CROSS|FULL)?(?:\s+OUTER)?\s+JOIN\b|\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|;|$)/gi)).map(m => {
+    const table = m[2].toLowerCase()
+    const condition = m[3].trim().replace(/\s+/g, ' ')
+    // 从 ON 条件里的 别名.列 引用解析连接的真实两端
+    const refs = Array.from(condition.matchAll(/([a-zA-Z_]\w*)\s*\./g)).map(r => r[1].toLowerCase())
+    const refTables = Array.from(new Set(refs.map(r => aliasMap[r]).filter((t): t is string => !!t)))
+    const fromTable = refTables.find(t => t !== table) || refTables[0] || tables[0]
+    const toTable = refTables.find(t => t !== fromTable) || table
+    return { type: (m[1] || 'INNER').trim().toUpperCase(), table, condition, fromTable, toTable }
+  })
   const whereMatch = sql.match(/WHERE\s+([\s\S]*?)(?:GROUP|ORDER|LIMIT|$)/i)
   const whereConditions = whereMatch ? whereMatch[1].split(/\s+AND\s+|\s+OR\s+/i).map(s => s.trim()).filter(Boolean) : []
   const orderBy = Array.from(sql.matchAll(/ORDER\s+BY\s+([\s\S]*?)(?:LIMIT|$)/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || []

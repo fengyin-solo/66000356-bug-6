@@ -21,7 +21,7 @@ export interface ParsedQuery {
   type: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'CREATE' | 'UNKNOWN'
   tables: string[]
   columns: string[]
-  joins: { type: string; table: string; condition: string }[]
+  joins: { type: string; table: string; condition: string; leftTable: string }[]
   whereConditions: string[]
   orderBy: string[]
   groupBy: string[]
@@ -56,9 +56,47 @@ const SCHEMA: SQLTable[] = [
 function parseSQL(sql: string): ParsedQuery {
   const up = sql.toUpperCase().trim()
   const type = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE'].find(t => up.startsWith(t)) as ParsedQuery['type'] || 'UNKNOWN'
-  const tables = Array.from(sql.matchAll(/(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z_]\w*)/gi)).map(m => m[1].toLowerCase())
+
+  // 收集涉及表（FROM / JOIN / INTO / UPDATE），同时记录别名 -> 表名
+  const tables: string[] = []
+  const aliasMap: Record<string, string> = {}
+  const KW = new Set(['ON', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'HAVING', 'SET', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL'])
+  function registerTable(name: string, alias?: string) {
+    const n = name.toLowerCase()
+    if (!tables.includes(n)) tables.push(n)
+    if (alias && !KW.has(alias.toUpperCase())) aliasMap[alias] = n
+  }
+  for (const m of sql.matchAll(/(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z_]\w*)(?:\s+(?:AS\s+)?([a-zA-Z_]\w*))?/gi)) {
+    registerTable(m[1], m[2])
+  }
+
   const columns = type === 'SELECT' ? Array.from(sql.matchAll(/SELECT\s+([\s\S]*?)\s+FROM/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || [] : []
-  const joins = Array.from(sql.matchAll(/(LEFT|RIGHT|INNER|OUTER|CROSS|FULL)?\s*JOIN\s+([a-zA-Z_]\w*)\s+ON\s+([^JOIN|WHERE|GROUP|ORDER|LIMIT]+)/gi)).map(m => ({ type: (m[1] || 'INNER').trim(), table: m[2], condition: m[3].trim() }))
+
+  // 解析 JOIN：类型、左表、目标表、ON 条件（ON 吃到下一个 JOIN/WHERE/GROUP/ORDER/LIMIT/HAVING 为止）
+  const joins: ParsedQuery['joins'] = []
+  for (const m of sql.matchAll(/(?:(LEFT\s+OUTER|RIGHT\s+OUTER|FULL\s+OUTER|LEFT|RIGHT|INNER|OUTER|CROSS|FULL)\s+)?JOIN\s+([a-zA-Z_]\w*)(?:\s+(?:AS\s+)?([a-zA-Z_]\w*))?\s+ON\s+([\s\S]*?)(?=\s+(?:LEFT\s+OUTER|RIGHT\s+OUTER|FULL\s+OUTER|LEFT|RIGHT|INNER|OUTER|CROSS|FULL)?\s*JOIN\b|\s+WHERE\b|\s+GROUP\b|\s+ORDER\b|\s+LIMIT\b|\s+HAVING\b|$)/gi)) {
+    const joinType = (m[1] || 'INNER').toUpperCase().replace(/\s+OUTER$/, '')
+    const table = m[2].toLowerCase()
+    const alias = m[3] && !KW.has(m[3].toUpperCase()) ? m[3] : undefined
+    registerTable(table, alias)
+    const condition = m[4].replace(/;+\s*$/, '').replace(/\s+/g, ' ').trim()
+
+    // 从 ON 条件推断连接两端：`a.x = b.y` 中两端的别名/表名各对应一张表
+    const sides = condition.split('=').map(s => s.trim().match(/^([a-zA-Z_]\w*)\./)?.[1])
+    const refTable = (ref?: string) => {
+      if (!ref) return undefined
+      if (aliasMap[ref]) return aliasMap[ref]
+      const lower = ref.toLowerCase()
+      return tables.includes(lower) ? lower : undefined
+    }
+    const leftRef = refTable(sides[0])
+    const rightRef = refTable(sides[1])
+    // 目标表必须是右表（或无法从条件分辨时回退到 FROM 首表）
+    const leftTable = (rightRef === table ? leftRef : rightRef !== table ? (leftRef !== table ? (leftRef || rightRef) : rightRef) : leftRef) || tables[0] || table
+
+    joins.push({ type: joinType, table, condition, leftTable })
+  }
+
   const whereMatch = sql.match(/WHERE\s+([\s\S]*?)(?:GROUP|ORDER|LIMIT|$)/i)
   const whereConditions = whereMatch ? whereMatch[1].split(/\s+AND\s+|\s+OR\s+/i).map(s => s.trim()).filter(Boolean) : []
   const orderBy = Array.from(sql.matchAll(/ORDER\s+BY\s+([\s\S]*?)(?:LIMIT|$)/gi))[0]?.[1]?.split(',').map((s: string) => s.trim()) || []
